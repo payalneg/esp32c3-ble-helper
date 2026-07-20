@@ -44,7 +44,7 @@ helper-command handling added.
 | Part | Notes |
 |---|---|
 | **ESP32-C3 board** | 4 MB flash, no PSRAM needed. Tested pinout = VESC Express (GPIO0/1). On a stock Seeed XIAO ESP32-C3 GPIO0/1 are **not broken out** — use D4/D5 instead (see below). |
-| **CAN transceiver** | **TJA1051T/3** (VIO variant) recommended. SN65HVD230 (native 3.3 V) also works. |
+| **CAN transceiver** | **TJA1051T/3** (VIO variant) — direct hookup. Field-tested: **TJA1050 modules and plain TJA1051** also work — add the resistor divider on RXD (below). SN65HVD230 (native 3.3 V) works too. |
 | **Power** | 5 V for the transceiver; the ESP board from its own 5 V/USB input. Common ground with the VESC. |
 
 ### Wiring (default pins — VESC Express layout)
@@ -62,13 +62,23 @@ GND     ───────────────► GND
                          CANL ───────────────────────► CANL
 ```
 
-* **TJA1051 without the “/3” suffix** (and the common blue TJA1050 modules)
-  runs 5 V logic: its RXD swings to 5 V and the ESP32-C3 is **not
-  5-V-tolerant**. Add a divider on RXD (e.g. 1 kΩ / 2 kΩ) or use the /3
-  variant with VIO.
+* **TJA1051 without the “/3” suffix and TJA1050 modules** run 5 V logic:
+  their RXD swings to 5 V and the ESP32-C3 is **not 5-V-tolerant**. With a
+  divider on RXD (e.g. 1 kΩ / 2 kΩ) both are field-tested working; TXD
+  connects directly (its input threshold accepts 3.3 V). The /3 variant
+  with VIO needs no divider.
 * **Termination:** the CAN bus needs 120 Ω at both physical ends. If the
   helper is an end node, enable/fit the resistor.
 * GPIO0/GPIO1 are safe for CAN on the C3 — its strapping pins are 2/8/9.
+
+### VESC Express boards
+
+The default pinout intentionally matches **VESC Express hardware**
+(`hw_xp_t.h`: ESP32-C3, CAN TX=GPIO1/RX=GPIO0, onboard transceiver) — this
+firmware should run on a VESC Express T / compatible board as a drop-in
+replacement, no wiring at all: flash it over USB and the helper takes over
+the board's CAN port. (Not yet verified on an original Trampa unit — reports
+welcome.)
 
 ### Alternative pins (stock XIAO ESP32-C3)
 
