@@ -1,143 +1,224 @@
-# VESC BLE Helper (Seeed XIAO ESP32-C3)
+# VESC BLE Helper
 
-BLE helper for a VESC-based e-bike: bridges a **BLE camera-shutter button**
-(HID keychain remote) and a **BLE cadence sensor** to the VESC controller over
-the **CAN bus**.
+**English** | [Русский](README.ru.md)
 
-* Button press — **throttle on/off** (the `throttle-on` flag in the LISP
-  script running on the VESC, the same switch the P4 display's touchscreen
-  flips).
-* Cadence sensor — **PAS** (pedal assist): pedaling sets the motor current
-  with ramps and delays; the setpoint streams to the VESC LISP arbiter at
-  20 Hz with a watchdog chain behind it.
-* Configuration — Python GUI (`tools/config_gui.py`) over BLE; the future
-  Android app will use the same GATT protocol.
-* Helper firmware updates — **OTA over BLE** from the GUI.
-* NUS (Nordic UART) — a transparent **VESC Tool ↔ CAN** bridge: connect
-  VESC Tool to the helper over BLE and configure the VESC itself.
+A tiny ESP32-C3 board that bridges **sleepy BLE gadgets** — camera-shutter
+remotes, media buttons, a BLE cadence sensor — to a **VESC motor controller
+over the CAN bus**.
 
-The BLE/CAN/PAS code is ported from the `esp32p4-android-auto` project
-(branch `pas-system`); the LISP script `lisp/main.lisp` is reused with one
-addition (the atomic throttle-toggle command).
+```
+[HID remote(s) ×3]──BLE──┐                              CAN 500k
+[Cadence sensor]────BLE──┼── ESP32-C3 ── TWAI ──[TJA1051]────── VESC (main.lisp)
+[GUI / Android app]─BLE──┘   NUS bridge + config service + OTA      │
+                                                              [P4 display]*
+                                                              * optional
+```
+
+What it does:
+
+* **Buttons → CAN commands.** Press a button on any bound HID remote and the
+  helper transmits a raw CAN frame you configured for it. A LispBM script on
+  the VESC receives the frame and acts: throttle on/off, speed-profile
+  switch, or anything you script. All semantics live in LISP — the helper is
+  a dumb, reliable bridge.
+* **Pedal assist (PAS).** Reads a BLE cadence sensor
+  ([payalneg/cadence-for-ebike](https://github.com/payalneg/cadence-for-ebike))
+  and streams a ramped motor-current setpoint to the VESC's LISP arbiter at
+  20 Hz, with a triple watchdog chain behind it.
+* **VESC Tool bridge.** Connect VESC Tool over BLE (Nordic UART Service) and
+  configure the VESC through the helper — the helper forwards the packets to
+  CAN transparently.
+* **Configurable over BLE.** A Python GUI (`tools/config_gui.py`) binds
+  devices, tunes PAS, assigns button commands and updates the firmware OTA.
+  A future Android app uses the same GATT protocol.
+
+The CAN/BLE/PAS core is ported from the
+[esp32p4-android-auto](../work/esp32p4-android-auto) project (branch
+`pas-system`); `lisp/main.lisp` is that project's motor-control script with
+helper-command handling added.
+
+---
 
 ## Hardware
 
-| What | How |
+| Part | Notes |
 |---|---|
-| Board | ESP32-C3 (4 MB flash, no PSRAM) |
-| CAN transceiver | TJA1051 (use the **/3 variant with VIO = 3.3 V** — the plain 5 V-logic TJA1051T drives RXD to 5 V, which the C3 is not tolerant of) or SN65HVD230 |
-| TWAI TX → TXD | **GPIO1** (default, same as VESC Express `hw_xp_t.h`; change in `menuconfig → VESC CAN`) |
-| TWAI RX ← RXD | **GPIO0** |
-| CAN bitrate | 500 kbps default; 125/250/500/1000 selectable in the GUI (persisted in NVS) |
+| **ESP32-C3 board** | 4 MB flash, no PSRAM needed. Tested pinout = VESC Express (GPIO0/1). On a stock Seeed XIAO ESP32-C3 GPIO0/1 are **not broken out** — use D4/D5 instead (see below). |
+| **CAN transceiver** | **TJA1051T/3** (VIO variant) recommended. SN65HVD230 (native 3.3 V) also works. |
+| **Power** | 5 V for the transceiver; the ESP board from its own 5 V/USB input. Common ground with the VESC. |
 
-> On a standard Seeed XIAO ESP32-C3 GPIO0/1 are not broken out — set
-> TX=7 (D5) / RX=6 (D4) via Kconfig there.
-> Note: GPIO0/1 double as ADC/XTAL_32K pins but have no boot-strapping role
-> on the C3 (strapping pins are 2/8/9), so CAN on 0/1 is safe.
+### Wiring (default pins — VESC Express layout)
 
-Default CAN IDs: helper **3**, P4 display **2**, VESC **10** (changeable in
-the GUI / NVS).
+```
+ESP32-C3                TJA1051T/3                    VESC / bus
+─────────               ──────────                    ──────────
+GPIO1  (CAN TX) ───────► TXD
+GPIO0  (CAN RX) ◄─────── RXD
+3V3     ───────────────► VIO   (logic level reference)
+5V      ───────────────► VCC
+GND     ───────────────► GND
+                         S ────► GND  (silent mode OFF)
+                         CANH ───────────────────────► CANH
+                         CANL ───────────────────────► CANL
+```
 
-## Build & flash
+* **TJA1051 without the “/3” suffix** (and the common blue TJA1050 modules)
+  runs 5 V logic: its RXD swings to 5 V and the ESP32-C3 is **not
+  5-V-tolerant**. Add a divider on RXD (e.g. 1 kΩ / 2 kΩ) or use the /3
+  variant with VIO.
+* **Termination:** the CAN bus needs 120 Ω at both physical ends. If the
+  helper is an end node, enable/fit the resistor.
+* GPIO0/GPIO1 are safe for CAN on the C3 — its strapping pins are 2/8/9.
+
+### Alternative pins (stock XIAO ESP32-C3)
+
+GPIO0/1 are not exposed on the XIAO. Set in `idf.py menuconfig → VESC CAN`:
+
+| Signal | XIAO pin | GPIO |
+|---|---|---|
+| CAN TX | D5 | GPIO7 |
+| CAN RX | D4 | GPIO6 |
+
+### Default CAN identities
+
+| Node | ID |
+|---|---|
+| Drive VESC | **10** |
+| Helper (this device) | **3** |
+| P4 display (if present) | 2 |
+
+Bitrate 500 kbps. IDs and bitrate (125/250/500/1000) are changeable in the
+GUI and persist in NVS.
+
+---
+
+## Building & flashing
+
+ESP-IDF v5.5+:
 
 ```bash
 source ~/.espressif/v5.5.3/esp-idf/export.sh
 idf.py set-target esp32c3
 idf.py build
-idf.py -p /dev/tty.usbmodem* flash monitor
+idf.py -p /dev/tty.usbmodem* flash monitor     # first flash over USB
 ```
 
-Subsequent updates go over BLE from the GUI ("Firmware" tab,
-file `build/esp32c3_ble_helper.bin`).
+Subsequent updates go **over BLE** from the GUI (Firmware tab, file
+`build/esp32c3_ble_helper.bin`).
 
-## Configuration (Python GUI)
+## First-time setup
 
 ```bash
 pip install bleak
 python3 tools/config_gui.py
 ```
 
-1. **Connect** — the GUI looks for a device named `VESC-BLE-Helper`.
-2. **Binding** tab: "Scan for button" (press the remote's button so it wakes
-   up and advertises) → pick it in the list → "Bind selected". Same for the
-   cadence sensor (spin the crank to wake it).
-3. **Parameters** tab: assist levels, cadence thresholds, max current, ramp,
-   CAN IDs. "Read" / "Write".
-4. **LISP** tab: upload `lisp/main.lisp` to the VESC (via the NUS bridge,
-   VESC Tool protocol). A minimal teaching example is
-   `lisp/throttle_toggle.lisp`.
-5. **Status** tab: live cadence, button state, throttle, assist current.
+1. **Connect** — the GUI finds the device advertising as `VESC-BLE-Helper`.
+2. **LISP tab** — upload `lisp/main.lisp` to the VESC (goes through the NUS
+   bridge using the VESC Tool protocol). This script owns the motor:
+   throttle/brake/cruise/PAS arbiter + helper-command handling.
+3. **Binding tab** — “Scan for button”, press a button on the remote so it
+   wakes up, select it, “Bind selected”. Repeat for more remotes (up to 3).
+   Same flow for the cadence sensor (spin the crank to wake it).
+4. **Press each button once.** Buttons are learned by their press signature:
+   the first button you ever press becomes **A**, the next **B**, … (up to
+   H, across all remotes). Watch the Status tab.
+5. **Parameters tab** — check the per-button CAN commands (defaults below),
+   PAS tuning, CAN IDs/bitrate. “Write” persists everything to NVS.
 
-Bindings and parameters persist in NVS across reboots; the button is bonded
-(keys in NVS too), and both devices reconnect automatically after sleeping.
+Bindings, bonds, learned buttons and parameters survive reboots; the remotes
+and the sensor reconnect automatically whenever they wake up.
 
-## How it works
+## Button commands
 
+Every button press transmits its configured CAN frame (hex ID + up to
+8 data bytes). Frames with a standard 11-bit ID are invisible to the VESC
+protocol and land directly in the LISP script via `event-can-sid`.
+
+Defaults (matching `lisp/main.lisp`):
+
+| Button | Frame | Action in `main.lisp` |
+|---|---|---|
+| A | id `123`, data `0001` | throttle master switch on/off |
+| B | id `123`, data `0002` | switch speed profile (beeps per profile) |
+| C… | id `123`, data `0003`… | printed — add your own in `proc-helper-btn` |
+
+The command is the data bytes read as a big-endian u16. To add an action,
+extend the `cond` in `proc-helper-btn`:
+
+```lisp
+((= cmd 3) (activate-cruise-control))   ; example: button C = cruise
 ```
-[HID button 0x1812]───BLE──┐                            CAN 500k
-[Cadence cad00002-…]──BLE──┼─ XIAO ESP32-C3 ─ TWAI ─[transceiver]── VESC (main.lisp)
-[GUI / Android app]───BLE──┘   NUS bridge + config service + OTA
-```
 
-* **`main/ble_central_mgr.c`** — NimBLE allows only one outstanding outgoing
-  connection attempt, but there are two sleepy peripherals; the manager keeps
-  a single whitelist-filtered connect covering every bound address — whichever
-  device wakes first connects instantly.
-* **`main/ble_hid_client.c`** — HOGP host for **any HID devices** (shutter
-  remotes, media buttons, mouse, …), up to **3 remotes bound and connected
-  simultaneously**: bonding (Just Works), subscribes to every input report.
-  Buttons are identified by their **press signature** (device + report +
-  byte + value), because cheap remotes often pack both physical buttons into
-  one report; signatures are learned on first press (first button you press
-  becomes A, next B, … up to H across all remotes), persisted in NVS,
-  cleared on unbind. 300 ms debounce per button. "Bind" adds a remote,
-  "Unbind" clears them all.
-* **Button → CAN command (GUI-configurable, NVS-persisted):** every button
-  press transmits its configured raw CAN frame (hex ID + up to 8 data bytes).
-  Frames with a standard 11-bit ID bypass the VESC protocol and land straight
-  in the LISP script via `event-can-sid` — ALL button semantics live in LISP.
-  Example wired into `lisp/main.lisp` (`proc-helper-btn`, commands are the
-  data bytes as big-endian u16): ID `123` data `0001` toggles the throttle,
-  `0002` switches the speed profile (with a beep); extend it with your own
-  commands, or start from the standalone skeleton
-  `lisp/can_button_skeleton.lisp`.
-* **`main/ble_cadence_client.c`** — client for
-  [payalneg/cadence-for-ebike](https://github.com/payalneg/cadence-for-ebike):
-  custom characteristic `cad00002-…` (int16 LE centi-RPM, sign = direction).
-* **`main/pas.c`** — cadence → current: SWITCH/PROPORTIONAL modes, levels,
-  start delay, A/s ramp, stop delay.
-* **`components/vesc_can/`** — TWAI + VESC protocol; the PAS setpoint rides
-  in a `'VP' 0x05` frame (i32 mA) on top of `COMM_CUSTOM_APP_DATA`.
-* **`lisp/main.lisp`** (on the VESC) — 100 Hz motor arbiter with priority
-  "master-off > brake > throttle > cruise > PAS > coast".
-* **Poll-free.** The helper never polls the VESC periodically: commands are
-  fire-and-forget into the LISP `panel-handle` event handler — the throttle
-  toggle is the atomic `'VP' 0x06` message (the script flips `throttle-on`
-  itself and replies with fresh state), the PAS setpoint is `0x05` at 20 Hz
-  only while pedaling. A one-shot state query runs at boot and when the GUI
-  connects.
+A standalone minimal receiver lives in `lisp/can_button_skeleton.lisp`;
+a minimal throttle-only script in `lisp/throttle_toggle.lisp`.
 
-### Safety chain
+## Pedal assist
 
-1. No sensor notifications for 600 ms → PAS treats cadence as zero.
-2. `vesc_lisp_panel` with no fresh setpoint for 400 ms → sends `0` once and
-   goes quiet.
+`pas.c` turns cadence into a current setpoint: SWITCH (fixed per level) or
+PROPORTIONAL (scales with cadence) modes, assist levels, start delay,
+initial-kick floor, A/s ramp, stop delay. The setpoint streams to the LISP
+arbiter as a `'VP' 0x05` frame at 20 Hz.
+
+Safety chain (each layer fails to coast):
+
+1. No sensor notifications for 600 ms → cadence treated as zero.
+2. No fresh setpoint for 400 ms → helper sends a single `0` and goes quiet.
 3. LISP: setpoint older than 0.4 s → coast.
-4. Script dies → `app-disable-output` expires within 1.5 s, the stock
-   throttle comes back, the motor stops via the command timeout.
+4. Script dies → `app-disable-output` expires in 1.5 s, stock throttle
+   returns, motor stops via the command timeout.
 
-### Sharing the bus with the P4 display
+## BLE interface (for app developers)
 
-* There must be exactly **one** source of the PAS setpoint: if the display
-  runs the `pas-system` branch, disable its on-device PAS (or flash the
-  master build).
-* All nodes need unique controller IDs (helper 3, display 2, VESC 10).
-* Both the button and the touchscreen may flip the throttle toggle — the
-  state lives on the VESC, last write wins.
+Advertised name `VESC-BLE-Helper`; the NUS UUID is in the advertisement (so
+VESC Tool finds it), the name is in the scan response.
 
-## Config-service protocol (for the Android app)
+| Service | UUID | Purpose |
+|---|---|---|
+| Nordic UART | `6e400001-b5a3-f393-e0a9-e50e24dcca9e` | transparent VESC Tool ↔ CAN bridge |
+| Config | `ab1e0001-b1e5-4e15-8ac3-5e00c0de15b7` | everything below |
 
-Service `ab1e0001-b1e5-4e15-8ac3-5e00c0de15b7`; full frame formats are
-documented in `main/ble_cfg_svc.h`. Characteristics: CTRL (commands +
-responses), STATUS (~2 Hz notifications), SCAN (scan-result stream),
-OTA-CTRL/OTA-DATA (firmware update).
+Config-service characteristics (`…0002`–`…0006`): CTRL (commands + acks),
+STATUS (~2 Hz notify + instant on button events), SCAN (scan results
+stream), OTA-CTRL / OTA-DATA (firmware update, stream-to-flash). Full frame
+formats are documented in [`main/ble_cfg_svc.h`](main/ble_cfg_svc.h).
+
+## Sharing the CAN bus with the P4 display
+
+* Exactly **one** PAS setpoint source on the bus: if the display runs the
+  `pas-system` firmware, disable its on-device PAS.
+* Unique controller IDs for every node.
+* The throttle switch state lives on the VESC — the display's touchscreen
+  and the helper's buttons can both flip it, last write wins.
+
+## Project layout
+
+```
+main/                   firmware application
+  ble_host.c            NimBLE dual-role host, advertising
+  ble_central_mgr.c     one shared whitelist connect for all central links
+  ble_hid_client.c      HOGP host, ×3 remotes, signature-learned buttons
+  ble_cadence_client.c  cadence sensor client (custom cad0000x service)
+  ble_nus.c             VESC Tool bridge (Nordic UART ↔ CAN)
+  ble_cfg_svc.c         config GATT service + OTA routing
+  ble_ota.c             BLE OTA, stream-to-flash (no PSRAM staging)
+  pas.c                 cadence → current control loop
+  throttle_ctl.c        throttle master-switch commands
+  settings.c            NVS: ids, bitrate, remotes, buttons, frames
+components/vesc_can/    TWAI driver + VESC CAN protocol + 'VP' transport
+lisp/
+  main.lisp             VESC-side motor arbiter + panel + helper commands
+  can_button_skeleton.lisp  minimal helper-command receiver
+  throttle_toggle.lisp  minimal throttle on/off example
+tools/config_gui.py     bleak + tkinter configurator
+```
+
+## Credits
+
+* CAN/BLE/PAS core and `main.lisp` — ported from `esp32p4-android-auto`
+  (branch `pas-system`).
+* Cadence sensor firmware —
+  [payalneg/cadence-for-ebike](https://github.com/payalneg/cadence-for-ebike)
+  (the helper only speaks its BLE protocol).
+* `components/vesc_can` protocol code — adapted from VESC firmware by
+  Benjamin Vedder (GPL-3.0).

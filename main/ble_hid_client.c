@@ -315,7 +315,16 @@ static int hid_scan_gap_event(struct ble_gap_event *event, void *arg)
                                     event->disc.length_data) != 0) {
             return 0;
         }
-        if (!adv_is_hid(&fields)) return 0;
+        /* HID markers are the fast path, but plenty of keyboards/remotes
+         * advertise neither the 0x1812 UUID nor an appearance (those often
+         * live only in the scan response, or nowhere) — so anything with a
+         * readable name is shown too. Binding is an explicit user pick, a
+         * longer list is harmless; nameless AND markerless beacons are
+         * still dropped to keep the noise down. */
+        if (!adv_is_hid(&fields) &&
+            !(fields.name && fields.name_len)) {
+            return 0;
+        }
         char name[32] = {0};
         if (fields.name && fields.name_len) {
             size_t n = fields.name_len < sizeof(name) - 1 ? fields.name_len
