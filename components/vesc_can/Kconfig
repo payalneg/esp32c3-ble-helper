@@ -1,0 +1,60 @@
+menu "VESC CAN"
+
+    config VESC_CAN_TX_GPIO
+        int "TWAI TX GPIO"
+        default 1
+        help
+            GPIO connected to TXD of the CAN transceiver (e.g. TJA1051).
+            Default 1 = same pin as VESC Express hardware (hw_xp_t.h).
+            On a standard XIAO ESP32-C3 GPIO0/1 are not broken out — use
+            e.g. 7 (D5) there.
+
+    config VESC_CAN_RX_GPIO
+        int "TWAI RX GPIO"
+        default 0
+        help
+            GPIO connected to RXD of the CAN transceiver.
+            Default 0 = same pin as VESC Express hardware. On a standard
+            XIAO ESP32-C3 use e.g. 6 (D4).
+
+    config VESC_CAN_SPEED_KBPS
+        int "CAN baud rate (kbps)"
+        default 500
+        help
+            VESC controllers default to 500 kbps. Allowed values:
+            125, 250, 500, 1000.
+
+    config VESC_CAN_CONTROLLER_ID
+        int "Helper CAN ID (this device)"
+        default 3
+        range 1 254
+        help
+            CAN ID announced by the BLE helper on the bus. Must be
+            different from any other VESC node (the P4 display defaults
+            to 2, the drive VESC to 10). 255 is reserved for broadcast.
+
+    config VESC_CAN_TARGET_ID
+        int "Target VESC ID"
+        default 10
+        range 1 254
+        help
+            CAN ID of the VESC controller polled for RT data.
+
+    config VESC_CAN_RT_INTERVAL_MS
+        int "RT data poll interval (ms)"
+        default 100
+        range 20 1000
+
+    config VESC_CAN_LISP_INTERVAL_MS
+        int "LISP stats poll interval (ms)"
+        default 100
+        range 20 1000
+
+    config VESC_CAN_LISP_POLL_ENABLE
+        bool "Enable LISP stats poll"
+        default n
+        help
+            Polls COMM_LISP_GET_STATS at the configured rate. Only
+            enable if your VESC has a LISP application loaded.
+
+endmenu

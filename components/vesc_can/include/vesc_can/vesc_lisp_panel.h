@@ -1,0 +1,185 @@
+/*
+    Copyright 2026 Adapted to ESP-IDF for ESP32-P4 (GPL-3.0).
+
+    LISP-driven quick-action panel transport.
+
+    A "master" LISP script running on the VESC describes a small panel of
+    controls (toggles / buttons / numbers / read-only labels) and their live
+    state; the P4 renders it (Super_VESC_Display/custom/lisp_panel.c) and sends
+    back interactions. The wire channel is COMM_CUSTOM_APP_DATA (id 36): the
+    firmware delivers it to the LISP `event-data-rx` event, and the script
+    replies with `(send-data buf 2 <reply-can-id>)` (FW 6.05+ explicit-CAN
+    routing — see the plan for why "last interface" is not relied upon).
+
+    Application frame (the COMM_CUSTOM_APP_DATA byte is added/stripped by the
+    firmware on both ends, so it never appears here):
+
+        [magic 'V'(0x56) 'P'(0x50)] [msg_type] [payload...]
+
+    P4 -> LISP  (msg_type, then always [u8 reply_can_id]):
+        REQ_UI    0x01  []
+        ACTION    0x02  [u8 ctrl_id][i32 value*1000]
+        REQ_STATE 0x03  []
+
+    LISP -> P4:
+        UI_DESC   0x81  [u8 ver][u8 count] then per control:
+                        [u8 id][u8 type][str label]
+                        TOGGLE: [u8 state]
+                        BUTTON: (nothing)
+                        NUMBER: [i32 min*1000][i32 max*1000][i32 step*1000]
+                                [i32 value*1000][str suffix]
+                        LABEL : [i32 value*1000][str suffix]
+        STATE     0x82  [u8 count] then per control: [u8 id][i32 value*1000]
+
+    All multi-byte integers are big-endian (buffer.h). Floats travel as
+    int32 = round(value * 1000) so both ends agree without an IEEE float
+    repack (the VESC float32_auto format is not available to LispBM).
+*/
+
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define VLP_MAGIC0      0x56u   /* 'V' */
+#define VLP_MAGIC1      0x50u   /* 'P' */
+#define VLP_PROTO_VER   1
+
+/* P4 -> LISP */
+#define VLP_MSG_REQ_UI    0x01u
+#define VLP_MSG_ACTION    0x02u
+#define VLP_MSG_REQ_STATE 0x03u
+#define VLP_MSG_REQ_DASH  0x04u   /* request dashboard stats (cruise + profile) */
+#define VLP_MSG_PAS_SET   0x05u   /* P4 -> LISP: [i32 pas_amps*1000] PAS target current (fire-and-forget) */
+#define VLP_MSG_THROTTLE_TOGGLE 0x06u /* helper -> LISP: [] atomic throttle-on
+                                       * toggle; the script flips its own state
+                                       * (no polling needed on the sender) and
+                                       * replies with STATE */
+/* LISP -> P4 */
+#define VLP_MSG_UI_DESC   0x81u
+#define VLP_MSG_STATE     0x82u
+#define VLP_MSG_DASH      0x84u   /* dashboard stats, fixed layout (see vlp_dash_t) */
+
+/* Quick-panel control id of the throttle master switch in lisp/main.lisp. */
+#define VLP_THROTTLE_CTRL_ID 1
+
+/* Fixed-point scale for all on-wire float values. */
+#define VLP_SCALE       1000.0f
+
+#define VLP_MAX_CTRLS   16
+#define VLP_LABEL_MAX   40
+#define VLP_SUFFIX_MAX  12
+
+typedef enum {
+    VLP_CTRL_TOGGLE = 1,
+    VLP_CTRL_BUTTON = 2,
+    VLP_CTRL_NUMBER = 3,
+    VLP_CTRL_LABEL  = 4,
+} vlp_ctrl_type_t;
+
+typedef struct {
+    uint8_t id;
+    uint8_t type;                  /* vlp_ctrl_type_t */
+    char    label[VLP_LABEL_MAX];
+    float   vmin, vmax, vstep;     /* NUMBER only */
+    float   value;                 /* TOGGLE: 0/1, NUMBER/LABEL: value */
+    char    suffix[VLP_SUFFIX_MAX];/* NUMBER/LABEL only */
+} vlp_ctrl_t;
+
+typedef struct {
+    uint8_t    version;
+    uint8_t    count;
+    vlp_ctrl_t ctrl[VLP_MAX_CTRLS];
+    uint32_t   ui_epoch;     /* bumped on each UI_DESC (layout change) */
+    uint32_t   state_epoch;  /* bumped on each UI_DESC or STATE (value change) */
+} vlp_model_t;
+
+/* Dashboard cruise/profile stats. Delivered over this same COMM_CUSTOM_APP_DATA
+ * channel rather than COMM_LISP_GET_STATS, whose monitor is hard-capped at 18
+ * variables by the VESC firmware — once the Lisp script has more globals than
+ * that, the dashboard's values fall out of the reported set. This packet has a
+ * fixed layout and no such limit. Decoded from the on-wire i32 (×1000) values. */
+typedef struct {
+    bool  valid;            /* false until the first DASH reply has arrived */
+    bool  cruise_active;
+    float cruise_rpm;
+    int   current_profile;
+    float rpm_per_ms;
+} vlp_dash_t;
+
+/* target_vesc_id = the VESC node running the master LISP script. The reply
+ * CAN id we ask the script to answer on is fetched live from comm_can. Safe
+ * to call repeatedly (mirrors vesc_lisp_poll_init). */
+void vesc_lisp_panel_init(uint8_t target_vesc_id);
+void vesc_lisp_panel_set_target(uint8_t target_vesc_id);
+
+/* Enable/disable the panel's CAN polling. Set from the LVGL task when the
+ * drawer opens/closes; the actual requests are issued from the CAN poll task
+ * (see vesc_lisp_panel_poll_loop) so all polls stay single-threaded. */
+void vesc_lisp_panel_set_enabled(bool enabled);
+
+/* Drive the panel's UI_DESC / STATE polling. MUST be called from the single
+ * CAN poll task (vesc_rt_data's rt_task), alongside the RT/LISP/IO polls, so
+ * their replies can't interleave in the shared reassembly buffer. No-ops while
+ * the drawer is closed. Also flushes any queued button/slider actions. */
+void vesc_lisp_panel_poll_loop(void);
+
+/* UI_DESC / STATE requests — issued from the CAN poll task via poll_loop. */
+void vesc_lisp_panel_request_ui(void);
+void vesc_lisp_panel_request_state(void);
+
+/* Dashboard cruise/profile stats — independent of the drawer (the dashboard
+ * always needs them). Poll from the single CAN poll task (rt_task) regardless
+ * of whether the panel is open. get_dash returns false until the first reply. */
+void vesc_lisp_panel_request_dash(void);
+void vesc_lisp_panel_dash_loop(void);
+bool vesc_lisp_panel_get_dash(vlp_dash_t *out);
+/* Button/toggle/slider action. Safe to call from any task (a tap handler /
+ * the BLE host task): it just queues the action; poll_loop sends it from the
+ * CAN poll task. The queue is flushed even while polling is disabled, so a
+ * poll-free (headless) device can still fire commands. */
+void vesc_lisp_panel_send_action(uint8_t ctrl_id, float value);
+
+/* Fire-and-forget throttle toggle (VLP_MSG_THROTTLE_TOGGLE): the LISP script
+ * flips `throttle-on` atomically on the VESC and replies with STATE — the
+ * sender never needs to know the current state, hence no polling. Queued like
+ * an action; safe from any task. */
+void vesc_lisp_panel_send_throttle_toggle(void);
+
+/* One-shot REQ_STATE (queued) — "query on demand" instead of polling; use it
+ * e.g. when the config GUI connects. The reply updates the model and the
+ * throttle snapshot below. */
+void vesc_lisp_panel_query_state(void);
+
+/* Last known `throttle-on` captured from any STATE / UI_DESC reply (toggle
+ * acks included). Returns false while no reply has ever been seen. */
+bool vesc_lisp_panel_get_throttle(bool *on);
+
+/* Pedal-assist (PAS) setpoint forwarding to the master LISP script.
+ *
+ * vesc_lisp_panel_set_pas() stores the requested PAS current (amps); it is
+ * thread-safe and may be called from any task (e.g. the PAS task). The actual
+ * CAN send is deferred to vesc_lisp_panel_pas_loop(), which MUST run on the
+ * single CAN poll task (rt_task) alongside the other polls. pas_loop re-sends
+ * the setpoint at ~20 Hz (so the VESC motor-command timeout stays fed) and acts
+ * as a watchdog: if no fresh setpoint arrives for ~400 ms it sends 0 once and
+ * goes quiet, letting the VESC coast. */
+void vesc_lisp_panel_set_pas(float amps);
+void vesc_lisp_panel_pas_loop(void);
+
+/* Fan-out hook — call from vesc_packet_dispatch. Gates on COMM_CUSTOM_APP_DATA
+ * + the 'VP' magic and ignores everything else. Runs on the CAN task. */
+void vesc_lisp_panel_process_response(const uint8_t *data, unsigned int len);
+
+/* Thread-safe snapshot for the LVGL renderer. Returns false until the first
+ * UI_DESC has been received. The renderer polls this and compares ui_epoch /
+ * state_epoch against the last values it drew. */
+bool vesc_lisp_panel_get_model(vlp_model_t *out);
+
+#ifdef __cplusplus
+}
+#endif

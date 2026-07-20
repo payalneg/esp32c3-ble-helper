@@ -1,0 +1,11 @@
+# ESP-IDF build output
+build/
+sdkconfig.old
+# Generated from sdkconfig.defaults (idf.py reconfigure recreates it)
+sdkconfig
+
+# Editors / OS
+.vscode/
+.cache/
+.DS_Store
+__pycache__/

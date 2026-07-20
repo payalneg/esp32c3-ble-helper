@@ -1,0 +1,26 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "ble_cadence_client.c"
+        "ble_central_mgr.c"
+        "ble_cfg_svc.c"
+        "ble_hid_client.c"
+        "ble_host.c"
+        "ble_nus.c"
+        "ble_ota.c"
+        "pas.c"
+        "settings.c"
+        "throttle_ctl.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        vesc_can
+    PRIV_REQUIRES
+        bt
+        nvs_flash
+        app_update
+        esp_partition
+        mbedtls
+        esp_timer
+        driver
+)

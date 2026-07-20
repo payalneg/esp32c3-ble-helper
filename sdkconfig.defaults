@@ -1,0 +1,28 @@
+CONFIG_IDF_TARGET="esp32c3"
+
+# 4 MB flash on the XIAO ESP32-C3, custom table with two OTA slots
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Native BLE controller + NimBLE host, dual role:
+# peripheral (NUS bridge + config/OTA service) and central (HID button +
+# cadence sensor GATT clients).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+# 1 phone/GUI + cadence + up to 3 HID remotes + spare
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=6
+# Controller activities: adv + 6 connections + scan headroom
+CONFIG_BT_CTRL_BLE_MAX_ACT=9
+# Bonds (HID button pairing) survive reboot
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+# Big MTU for the VESC Tool bridge and OTA throughput
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
+
+# comm_can uses the legacy driver/twai.h API; silence the deprecation build
+# noise until the component migrates to esp_twai.
+CONFIG_TWAI_SKIP_LEGACY_CONFLICT_CHECK=y

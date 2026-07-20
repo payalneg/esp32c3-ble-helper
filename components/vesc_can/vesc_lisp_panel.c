@@ -1,0 +1,455 @@
+/*
+    Copyright 2026 Adapted to ESP-IDF for ESP32-P4 (GPL-3.0).
+
+    Transport for the LISP-driven quick-action panel. See vesc_lisp_panel.h
+    for the wire protocol. Outgoing requests are sent on the LVGL task;
+    incoming UI_DESC/STATE replies are parsed on the CAN process task and
+    merged into a mutex-guarded model that the renderer snapshots.
+*/
+
+#include "vesc_can/vesc_lisp_panel.h"
+
+#include "vesc_can/buffer.h"
+#include "vesc_can/comm_can.h"
+#include "vesc_can/vesc_datatypes.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+#include "esp_log.h"
+#include "esp_timer.h"
+
+#include <string.h>
+
+static const char *TAG = "vesc_lisp_panel";
+
+#define VLP_POLL_INTERVAL_MS  200
+#define VLP_ACTION_QUEUE_LEN  8
+
+static uint8_t            s_target_vesc_id = 10;
+static SemaphoreHandle_t  s_lock;          /* guards s_model */
+static vlp_model_t        s_model;         /* authoritative model */
+static bool               s_have_ui;       /* set once a UI_DESC lands */
+
+/* CAN polling state — all touched only by the poll task (poll_loop), except
+ * s_enabled (set from the LVGL task on open/close) and the action queue. */
+static volatile bool      s_enabled;       /* drawer open → keep polling */
+static uint32_t           s_last_poll_ms;
+static QueueHandle_t      s_action_q;      /* {id,value} from LVGL tap handlers */
+
+/* Dashboard stats — polled always (not gated by the drawer); guarded by s_lock. */
+static vlp_dash_t         s_dash;
+static uint32_t           s_dash_last_ms;
+#define VLP_DASH_INTERVAL_MS  200
+
+/* PAS setpoint forwarding. s_pas_amps/s_pas_seen_ms are written from the PAS
+ * task (set_pas) and read on the CAN poll task (pas_loop); a portMUX keeps the
+ * value+timestamp pair coherent across cores. */
+#define VLP_PAS_WATCHDOG_MS   400   /* no fresh setpoint => coast (send 0 once) */
+#define VLP_PAS_SEND_MS        50   /* re-send cadence to feed VESC cmd timeout */
+static portMUX_TYPE       s_pas_mux = portMUX_INITIALIZER_UNLOCKED;
+static float              s_pas_amps;        /* last requested PAS current (A) */
+static uint32_t           s_pas_seen_ms;     /* millis_now() of last set_pas; 0 = never */
+static uint32_t           s_pas_last_send_ms;
+static bool               s_pas_sent_zero;   /* latched after the watchdog coast send */
+
+typedef struct { uint8_t id; float value; } vlp_action_t;
+
+/* Sentinel queue ids for one-shot commands that are not panel-control taps.
+ * Real control ids are small (1..VLP_MAX_CTRLS), so the top values are free. */
+#define ACT_TOGGLE_THROTTLE 0xFF
+#define ACT_QUERY_STATE     0xFE
+
+/* Last known throttle-on, captured from STATE / UI_DESC replies (guarded by
+ * s_lock together with the model). */
+static bool s_thr_known;
+static bool s_thr_on;
+
+static inline uint32_t millis_now(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+void vesc_lisp_panel_init(uint8_t target_vesc_id)
+{
+    s_target_vesc_id = target_vesc_id;
+    if (!s_lock) {
+        s_lock = xSemaphoreCreateMutex();
+    }
+    if (!s_action_q) {
+        s_action_q = xQueueCreate(VLP_ACTION_QUEUE_LEN, sizeof(vlp_action_t));
+    }
+    s_enabled = false;
+    portENTER_CRITICAL(&s_pas_mux);
+    s_pas_amps        = 0.0f;
+    s_pas_seen_ms     = 0;
+    s_pas_last_send_ms = 0;
+    s_pas_sent_zero   = false;
+    portEXIT_CRITICAL(&s_pas_mux);
+    if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        memset(&s_model, 0, sizeof(s_model));
+        s_have_ui = false;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void vesc_lisp_panel_set_target(uint8_t target_vesc_id)
+{
+    s_target_vesc_id = target_vesc_id;
+}
+
+/* ---- outgoing ----
+ *
+ * send_request runs on the single CAN poll task (via poll_loop) and waits for
+ * the reply, exactly like the RT/LISP/IO polls — that is what keeps the panel's
+ * big UI_DESC reply from colliding with theirs in the shared per-id reassembly
+ * buffer. Tap handlers on the LVGL task never send directly; they queue an
+ * action that poll_loop drains. */
+
+static void send_request(uint8_t msg, uint8_t ctrl_id, float value,
+                         bool has_action)
+{
+    uint8_t buf[16];
+    int32_t ind = 0;
+    buf[ind++] = COMM_CUSTOM_APP_DATA;
+    buf[ind++] = VLP_MAGIC0;
+    buf[ind++] = VLP_MAGIC1;
+    buf[ind++] = msg;
+    buf[ind++] = comm_can_get_local_id();   /* reply_can_id */
+    if (has_action) {
+        buf[ind++] = ctrl_id;
+        buffer_append_float32(buf, value, VLP_SCALE, &ind);
+    }
+    comm_can_send_buffer_sync(s_target_vesc_id, buf, (unsigned int)ind, 0, 60);
+}
+
+void vesc_lisp_panel_request_ui(void)
+{
+    send_request(VLP_MSG_REQ_UI, 0, 0.0f, false);
+}
+
+void vesc_lisp_panel_request_state(void)
+{
+    send_request(VLP_MSG_REQ_STATE, 0, 0.0f, false);
+}
+
+void vesc_lisp_panel_send_action(uint8_t ctrl_id, float value)
+{
+    /* Queue only — the actual send happens on the CAN poll task (poll_loop),
+     * so every panel request stays on one thread. Drop silently if the queue
+     * is full (8 deep) or polling isn't up yet; a lost tap is harmless. */
+    if (!s_action_q) return;
+    vlp_action_t a = { .id = ctrl_id, .value = value };
+    xQueueSend(s_action_q, &a, 0);
+}
+
+void vesc_lisp_panel_send_throttle_toggle(void)
+{
+    if (!s_action_q) return;
+    vlp_action_t a = { .id = ACT_TOGGLE_THROTTLE, .value = 0.0f };
+    xQueueSend(s_action_q, &a, 0);
+}
+
+void vesc_lisp_panel_query_state(void)
+{
+    if (!s_action_q) return;
+    vlp_action_t a = { .id = ACT_QUERY_STATE, .value = 0.0f };
+    xQueueSend(s_action_q, &a, 0);
+}
+
+/* ---- PAS setpoint forwarding ---- */
+
+static void send_pas(float amps)
+{
+    /* Fire-and-forget: send=3 (no reply expected) so the CAN task never blocks
+     * waiting for a reassembled reply. The LISP event-data-rx handler just
+     * stores the value; it does not reply. */
+    uint8_t buf[12];
+    int32_t ind = 0;
+    buf[ind++] = COMM_CUSTOM_APP_DATA;
+    buf[ind++] = VLP_MAGIC0;
+    buf[ind++] = VLP_MAGIC1;
+    buf[ind++] = VLP_MSG_PAS_SET;
+    buf[ind++] = comm_can_get_local_id();   /* reply_can_id (unused by PAS) */
+    buffer_append_float32(buf, amps, VLP_SCALE, &ind);
+    comm_can_send_buffer(s_target_vesc_id, buf, (unsigned int)ind, 3);
+}
+
+void vesc_lisp_panel_set_pas(float amps)
+{
+    uint32_t now = millis_now();
+    portENTER_CRITICAL(&s_pas_mux);
+    s_pas_amps      = amps;
+    s_pas_seen_ms   = now ? now : 1;   /* never store 0 (= "never seen") */
+    s_pas_sent_zero = false;           /* fresh data re-arms the watchdog */
+    portEXIT_CRITICAL(&s_pas_mux);
+}
+
+void vesc_lisp_panel_pas_loop(void)
+{
+    uint32_t now = millis_now();
+    float    amps;
+    uint32_t seen;
+    bool     sent_zero;
+    portENTER_CRITICAL(&s_pas_mux);
+    amps      = s_pas_amps;
+    seen      = s_pas_seen_ms;
+    sent_zero = s_pas_sent_zero;
+    portEXIT_CRITICAL(&s_pas_mux);
+
+    if (seen == 0) return;                       /* no setpoint ever received */
+
+    if (now - seen > VLP_PAS_WATCHDOG_MS) {
+        /* Stale (sensor dropped / PAS task wedged): send 0 once, then go quiet.
+         * The VESC's motor-command timeout then ramps to coast on its own. Do
+         * NOT keep re-sending the last nonzero value — that would defeat the
+         * coast. */
+        if (!sent_zero) {
+            send_pas(0.0f);
+            portENTER_CRITICAL(&s_pas_mux);
+            s_pas_sent_zero = true;
+            portEXIT_CRITICAL(&s_pas_mux);
+        }
+        return;
+    }
+
+    /* Fresh: re-send at ~20 Hz so the VESC keeps the command alive even if the
+     * PAS task's tick jitters or a CAN frame is dropped. */
+    if (now - s_pas_last_send_ms < VLP_PAS_SEND_MS) return;
+    s_pas_last_send_ms = now;
+    send_pas(amps);
+}
+
+void vesc_lisp_panel_set_enabled(bool enabled)
+{
+    s_enabled = enabled;
+    if (enabled) s_last_poll_ms = 0;   /* poll immediately on open */
+    ESP_LOGW(TAG, "panel %s (target=%u)", enabled ? "ENABLED" : "disabled", s_target_vesc_id);
+}
+
+void vesc_lisp_panel_poll_loop(void)
+{
+    /* Queued one-shot commands (taps, throttle toggle, state queries) flush
+     * regardless of s_enabled — a poll-free headless device still needs the
+     * command path. Only the PERIODIC UI/STATE polling below is gated. */
+    if (s_action_q) {
+        vlp_action_t a;
+        while (xQueueReceive(s_action_q, &a, 0) == pdTRUE) {
+            switch (a.id) {
+            case ACT_TOGGLE_THROTTLE:
+                send_request(VLP_MSG_THROTTLE_TOGGLE, 0, 0.0f, false);
+                break;
+            case ACT_QUERY_STATE:
+                send_request(VLP_MSG_REQ_STATE, 0, 0.0f, false);
+                break;
+            default:
+                send_request(VLP_MSG_ACTION, a.id, a.value, true);
+                break;
+            }
+        }
+    }
+
+    if (!s_enabled) return;
+
+    uint32_t now = millis_now();
+    if (now - s_last_poll_ms < VLP_POLL_INTERVAL_MS) return;
+    s_last_poll_ms = now;
+
+    /* Keep nudging for the UI descriptor until it lands, then poll live state. */
+    if (!s_have_ui) {
+        vesc_lisp_panel_request_ui();
+    } else {
+        vesc_lisp_panel_request_state();
+    }
+}
+
+void vesc_lisp_panel_request_dash(void)
+{
+    send_request(VLP_MSG_REQ_DASH, 0, 0.0f, false);
+}
+
+void vesc_lisp_panel_dash_loop(void)
+{
+    /* On the P4 display this ran always-on (the dashboard needs cruise/
+     * profile). The helper is poll-free: nothing consumes the dash stats, so
+     * gate it behind s_enabled like the rest of the periodic polling. */
+    if (!s_enabled) return;
+    uint32_t now = millis_now();
+    if (now - s_dash_last_ms < VLP_DASH_INTERVAL_MS) return;
+    s_dash_last_ms = now;
+    vesc_lisp_panel_request_dash();
+}
+
+bool vesc_lisp_panel_get_dash(vlp_dash_t *out)
+{
+    if (!out || !s_lock) return false;
+    bool ok = false;
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        *out = s_dash;
+        ok = s_dash.valid;
+        xSemaphoreGive(s_lock);
+    }
+    return ok;
+}
+
+/* ---- incoming ---- */
+
+static void parse_ui_desc(const uint8_t *data, unsigned int len, int32_t ind)
+{
+    /* static, not on the stack: vlp_model_t is ~1.2 KB (ctrl[16]) and this runs
+     * on the can_proc task whose stack is small — a stack frame this big
+     * overflowed it and rebooted the device the moment a panel UI_DESC arrived.
+     * parse_ui_desc is only ever called from can_proc, so a single static
+     * scratch instance is safe. */
+    static vlp_model_t m;
+    memset(&m, 0, sizeof(m));
+
+    if (ind + 2 > (int)len) return;
+    m.version = data[ind++];
+    uint8_t count = data[ind++];
+
+    for (uint8_t i = 0; i < count && m.count < VLP_MAX_CTRLS; i++) {
+        if (ind + 2 > (int)len) break;
+        vlp_ctrl_t *c = &m.ctrl[m.count];
+        c->id   = data[ind++];
+        c->type = data[ind++];
+
+        buffer_get_string(data, (int)len, c->label, sizeof(c->label), &ind);
+
+        switch (c->type) {
+        case VLP_CTRL_TOGGLE:
+            if (ind + 1 > (int)len) return;
+            c->value = data[ind++] ? 1.0f : 0.0f;
+            break;
+        case VLP_CTRL_BUTTON:
+            break;
+        case VLP_CTRL_NUMBER:
+            if (ind + 16 > (int)len) return;
+            c->vmin  = buffer_get_float32(data, VLP_SCALE, &ind);
+            c->vmax  = buffer_get_float32(data, VLP_SCALE, &ind);
+            c->vstep = buffer_get_float32(data, VLP_SCALE, &ind);
+            c->value = buffer_get_float32(data, VLP_SCALE, &ind);
+            buffer_get_string(data, (int)len, c->suffix, sizeof(c->suffix), &ind);
+            break;
+        case VLP_CTRL_LABEL:
+            if (ind + 4 > (int)len) return;
+            c->value = buffer_get_float32(data, VLP_SCALE, &ind);
+            buffer_get_string(data, (int)len, c->suffix, sizeof(c->suffix), &ind);
+            break;
+        default:
+            /* Unknown control type — we can't know its tail size, so the
+             * rest of the frame is unparseable. Commit what we have. */
+            ESP_LOGW(TAG, "unknown ctrl type %u — truncating", c->type);
+            goto commit;
+        }
+        m.count++;
+    }
+
+commit:
+    ESP_LOGI(TAG, "UI_DESC parsed: ver=%u count=%u", m.version, m.count);
+    if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        uint32_t ui = s_model.ui_epoch, st = s_model.state_epoch;
+        s_model = m;
+        s_model.ui_epoch    = ui + 1;
+        s_model.state_epoch = st + 1;
+        s_have_ui = true;
+        for (uint8_t k = 0; k < m.count; k++) {
+            if (m.ctrl[k].id == VLP_THROTTLE_CTRL_ID &&
+                m.ctrl[k].type == VLP_CTRL_TOGGLE) {
+                s_thr_on    = m.ctrl[k].value > 0.5f;
+                s_thr_known = true;
+            }
+        }
+        xSemaphoreGive(s_lock);
+    }
+}
+
+static void parse_state(const uint8_t *data, unsigned int len, int32_t ind)
+{
+    if (ind + 1 > (int)len) return;
+    uint8_t count = data[ind++];
+
+    if (!s_lock || xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return;
+    bool changed = false;
+    for (uint8_t i = 0; i < count; i++) {
+        if (ind + 5 > (int)len) break;          /* id + i32 */
+        uint8_t id = data[ind++];
+        float v = buffer_get_float32(data, VLP_SCALE, &ind);
+        /* Throttle snapshot is captured even without a UI_DESC (the poll-free
+         * helper only ever sees the STATE replies to its own commands). */
+        if (id == VLP_THROTTLE_CTRL_ID) {
+            s_thr_on    = v > 0.5f;
+            s_thr_known = true;
+        }
+        for (uint8_t k = 0; k < s_model.count; k++) {
+            if (s_model.ctrl[k].id == id) {
+                s_model.ctrl[k].value = v;
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (changed) s_model.state_epoch++;
+    xSemaphoreGive(s_lock);
+}
+
+bool vesc_lisp_panel_get_throttle(bool *on)
+{
+    if (!s_lock) return false;
+    bool known = false;
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        known = s_thr_known;
+        if (on) *on = s_thr_on;
+        xSemaphoreGive(s_lock);
+    }
+    return known;
+}
+
+static void parse_dash(const uint8_t *data, unsigned int len, int32_t ind)
+{
+    if (ind + 16 > (int)len) return;            /* need 4 × i32 */
+    int32_t ca = buffer_get_int32(data, &ind);
+    float   cr = buffer_get_float32(data, VLP_SCALE, &ind);
+    int32_t cp = buffer_get_int32(data, &ind);
+    float   rpm = buffer_get_float32(data, VLP_SCALE, &ind);
+    if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        s_dash.valid           = true;
+        s_dash.cruise_active   = (ca != 0);
+        s_dash.cruise_rpm      = cr;
+        s_dash.current_profile = cp / 1000;     /* sent as profile × 1000 */
+        s_dash.rpm_per_ms      = rpm;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void vesc_lisp_panel_process_response(const uint8_t *data, unsigned int len)
+{
+    if (len < 4) return;
+    if (data[0] != COMM_CUSTOM_APP_DATA) return;
+    if (data[1] != VLP_MAGIC0 || data[2] != VLP_MAGIC1) return;
+
+    uint8_t msg = data[3];
+    int32_t ind = 4;
+    if (msg == VLP_MSG_UI_DESC) {
+        parse_ui_desc(data, len, ind);
+    } else if (msg == VLP_MSG_STATE) {
+        parse_state(data, len, ind);
+    } else if (msg == VLP_MSG_DASH) {
+        parse_dash(data, len, ind);
+    }
+}
+
+bool vesc_lisp_panel_get_model(vlp_model_t *out)
+{
+    if (!out || !s_lock) return false;
+    bool ok = false;
+    if (xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        if (s_have_ui) {
+            *out = s_model;
+            ok = true;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return ok;
+}

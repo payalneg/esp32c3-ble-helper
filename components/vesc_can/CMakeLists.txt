@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "buffer.c"
+        "crc.c"
+        "comm_can.c"
+        "packet_parser.c"
+        "vesc_rt_data.c"
+        "vesc_lisp_poll.c"
+        "vesc_io_data.c"
+        "vesc_lisp_code.c"
+        "vesc_lisp_panel.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_common
+    PRIV_REQUIRES
+        driver
+        esp_timer
+)
