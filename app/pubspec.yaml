@@ -1,0 +1,31 @@
+name: vesc_ble_helper
+description: "Mobile configurator for the VESC BLE Helper (XIAO ESP32-C3)."
+publish_to: 'none'
+
+version: 1.0.4+6
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Pinned exactly: the BLE layer was written against this version's API.
+  flutter_blue_plus: 1.36.8
+  crypto: ^3.0.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
+  # Bundled payloads: the helper firmware (OTA tab) and the VESC LISP
+  # script (LISP tab). Refresh with tools/sync_app_assets.sh after
+  # rebuilding the firmware or editing lisp/main.lisp.
+  assets:
+    - assets/firmware/esp32c3_ble_helper.bin
+    - assets/firmware/version.txt
+    - assets/lisp/main.lisp
