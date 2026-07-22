@@ -195,8 +195,12 @@ formats are documented in [`main/ble_cfg_svc.h`](main/ble_cfg_svc.h).
 
 ## Sharing the CAN bus with the P4 display
 
-* Exactly **one** PAS setpoint source on the bus: if the display runs the
-  `pas-system` firmware, disable its on-device PAS.
+* **PAS source arbitration** is built into `main.lisp`: the arbiter locks
+  onto whichever node sent the last non-zero setpoint and ignores other
+  senders' zeros until that source stops (older display firmware idles at
+  0 A / 20 Hz forever — without the lock those zeros interleave with the
+  helper's assist current and the motor jerks). Still, prefer having PAS
+  enabled on only one node — the one the cadence sensor is bound to.
 * Unique controller IDs for every node.
 * The throttle switch state lives on the VESC — the display's touchscreen
   and the helper's buttons can both flip it, last write wins.

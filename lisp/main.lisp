@@ -37,11 +37,14 @@
                   (if (and v (>= v 0) (<= v 50)) v 40)))
 (def melody-vol-dirty 0)
 (def playing-idx -1)
-; Pedal-assist setpoint from the head unit (over COMM_CUSTOM_APP_DATA, msg 0x05).
-; pas-amps is the requested motor current (A); pas-seen is the (systime) of the
-; last frame, for a staleness check. tq'd at runtime → MUST stay above @const.
+; Pedal-assist setpoint from the head unit / BLE helper (over
+; COMM_CUSTOM_APP_DATA, msg 0x05). pas-amps is the requested motor current
+; (A); pas-seen is the (systime) of the last accepted frame, for a staleness
+; check; pas-src is the CAN id of the sender we are locked onto (-1 = none) —
+; see the 0x05 handler. setq'd at runtime → MUST stay above @const.
 (def pas-amps 0.0)
 (def pas-seen 0)
+(def pas-src -1)
 ; @const-start flashes every definition below, freeing the cons heap. Without it
 ; all the defun bodies live in RAM and exhaust the heap — panel-event-loop then
 ; OOMs at runtime and the display goes blank while motor control keeps running.
@@ -349,8 +352,25 @@
                 ((= msg 0x05) {
                     ; Pedal-assist setpoint (fire-and-forget, no reply). i32 mA at
                     ; byte 4 (after magic[0,1], msg[2], reply-id[3]).
-                    (setq pas-amps (/ (bufget-i32 data 4) 1000.0))
-                    (setq pas-seen (systime))
+                    ;
+                    ; SOURCE LOCK: more than one node may stream setpoints (the
+                    ; P4 display's on-device PAS idles at 0 A, 20 Hz, forever).
+                    ; Interleaved with a real assist current those zeros chop
+                    ; pas-amps into 3→0→3… and the motor jerks. So: lock onto
+                    ; whoever sent the last NON-ZERO setpoint (reply-id = the
+                    ; sender's CAN id) and ignore other senders until that
+                    ; source goes silent/zero; a zero from the locked source
+                    ; releases the lock, staleness (0.4 s) releases it too.
+                    (let ((amps (/ (bufget-i32 data 4) 1000.0)))
+                        (if (or (= pas-src reply-id)
+                                (= pas-src -1)
+                                (> (secs-since pas-seen) 0.4))
+                            {
+                                (setq pas-amps amps)
+                                (setq pas-seen (systime))
+                                (setq pas-src (if (> amps 0.0) reply-id -1))
+                            }
+                            nil))
                 })
                 ((= msg 0x06) {
                     ; Atomic throttle toggle from the BLE helper (its GUI /
