@@ -19,6 +19,7 @@ idf_component_register(
         bt
         nvs_flash
         app_update
+        esp_app_format
         esp_partition
         mbedtls
         esp_timer

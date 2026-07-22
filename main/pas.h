@@ -65,8 +65,8 @@ void pas_set_enabled(bool enabled);
 void pas_set_level(uint8_t level);
 
 /* Sensor binding. select persists the address and (re)connects via the cadence
- * client; forget unbinds + clears NVS. Scanning is started directly through
- * ble_cadence_scan_start() by the protocol handler. */
+ * client; forget unbinds + clears NVS. Selection scans are started directly
+ * through ble_central_mgr_select_start() by the protocol handler. */
 void pas_sensor_select(const uint8_t addr[6], uint8_t addr_type);
 void pas_sensor_forget(void);
 

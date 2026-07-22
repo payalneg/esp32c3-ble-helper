@@ -116,6 +116,7 @@ static void pas_task(void *arg)
     (void)arg;
     /* Per-loop state (task-local). */
     float    out_a       = 0.0f;
+    float    sent_a      = 0.0f;   /* last value handed to the CAN sender */
     bool     engaged     = false;
     uint32_t first_pedal_ms = 0;
     uint32_t last_pedal_ms  = 0;
@@ -196,9 +197,15 @@ static void pas_task(void *arg)
             engaged = false;
         }
 
-        /* Forward to the LISP arbiter (0 when disabled / not assisting → coast,
-         * and keeps the watchdog fed). */
-        vesc_lisp_panel_set_pas(out_a);
+        /* Forward to the LISP arbiter — but only while there is something to
+         * say. Feeding a constant 0 would keep the 20 Hz CAN stream alive
+         * forever (parked bike included); instead the final 0 of a ramp-down
+         * is sent once and then the sender's own watchdog goes quiet, so the
+         * bus is silent whenever assist is off. */
+        if (out_a > 0.0f || sent_a > 0.0f) {
+            vesc_lisp_panel_set_pas(out_a);
+        }
+        sent_a = out_a;
 
         portENTER_CRITICAL(&s_mux);
         s_telem.centi_rpm        = cad.centi_rpm;

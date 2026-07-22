@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +14,7 @@
 #include "os/os_mbuf.h"
 
 #include "ble_cadence_client.h"
+#include "ble_central_mgr.h"
 #include "ble_hid_client.h"
 #include "ble_ota.h"
 #include "pas.h"
@@ -62,6 +64,11 @@ static const ble_uuid128_t CFG_OTA_CTRL_UUID = BLE_UUID128_INIT(
     CFG_UUID_TAIL_LE, 0x05, 0x00, 0x1e, 0xab);
 static const ble_uuid128_t CFG_OTA_DATA_UUID = BLE_UUID128_INIT(
     CFG_UUID_TAIL_LE, 0x06, 0x00, 0x1e, 0xab);
+
+/* Device Information Service: Firmware Revision String. The app reads it on
+ * connect and compares with its bundled image to offer the OTA update. */
+static const ble_uuid16_t DIS_SVC_UUID    = BLE_UUID16_INIT(0x180A);
+static const ble_uuid16_t DIS_FW_REV_UUID = BLE_UUID16_INIT(0x2A26);
 
 /* ---- state ---- */
 
@@ -205,33 +212,21 @@ void ble_cfg_svc_notify_status_now(void)
 
 /* ---- scan-result fan-in (NimBLE host task) ---- */
 
-static void send_scan_result(uint8_t what, const uint8_t addr[6],
-                             uint8_t addr_type, const char *name, int8_t rssi)
+static void select_scan_cb(ble_central_select_t what, const uint8_t addr[6],
+                           uint8_t addr_type, const char *name, int8_t rssi)
 {
     if (!s_scan_subscribed) return;
     uint8_t f[10 + 31];
     size_t  nlen = name ? strlen(name) : 0;
     if (nlen > 31) nlen = 31;
     int i = 0;
-    f[i++] = what;
+    f[i++] = (uint8_t)what;   /* enum values match WHAT_BUTTON/WHAT_CADENCE */
     f[i++] = addr_type;
     memcpy(&f[i], addr, 6); i += 6;
     f[i++] = (uint8_t)rssi;
     f[i++] = (uint8_t)nlen;
     memcpy(&f[i], name, nlen); i += nlen;
     notify(s_scan_val_handle, f, (uint16_t)i);
-}
-
-static void cadence_scan_cb(const uint8_t addr[6], uint8_t addr_type,
-                            const char *name, int8_t rssi)
-{
-    send_scan_result(WHAT_CADENCE, addr, addr_type, name, rssi);
-}
-
-static void hid_scan_cb(const uint8_t addr[6], uint8_t addr_type,
-                        const char *name, int8_t rssi)
-{
-    send_scan_result(WHAT_BUTTON, addr, addr_type, name, rssi);
 }
 
 /* ---- command dispatch (NimBLE host task) ---- */
@@ -243,9 +238,11 @@ static void handle_ctrl(const uint8_t *p, uint16_t len)
     switch (cmd) {
     case CMD_SCAN:
         if (len < 2) { ctrl_ack(cmd, 2); return; }
-        if (p[1] == WHAT_BUTTON)       ble_hid_scan_start();
-        else if (p[1] == WHAT_CADENCE) ble_cadence_scan_start();
-        else { ctrl_ack(cmd, 2); return; }
+        if (p[1] == WHAT_BUTTON) {
+            ble_central_mgr_select_start(BLE_CENTRAL_SELECT_BUTTON);
+        } else if (p[1] == WHAT_CADENCE) {
+            ble_central_mgr_select_start(BLE_CENTRAL_SELECT_CADENCE);
+        } else { ctrl_ack(cmd, 2); return; }
         ctrl_ack(cmd, 0);
         break;
 
@@ -371,6 +368,19 @@ static int chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
+static int fw_rev_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+        return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    }
+    /* PROJECT_VER — IDF fills it from version.txt at build time. */
+    const esp_app_desc_t *app = esp_app_get_description();
+    return os_mbuf_append(ctxt->om, app->version, strlen(app->version)) == 0
+               ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
 static const struct ble_gatt_svc_def s_cfg_svcs[] = {
     {
         .type            = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -407,6 +417,18 @@ static const struct ble_gatt_svc_def s_cfg_svcs[] = {
                 .access_cb  = chr_access_cb,
                 .flags      = BLE_GATT_CHR_F_WRITE_NO_RSP,
                 .val_handle = &s_ota_data_val_handle,
+            },
+            { 0 },
+        },
+    },
+    {
+        .type            = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid            = &DIS_SVC_UUID.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid      = &DIS_FW_REV_UUID.u,
+                .access_cb = fw_rev_access_cb,
+                .flags     = BLE_GATT_CHR_F_READ,
             },
             { 0 },
         },
@@ -475,8 +497,7 @@ void ble_cfg_svc_on_subscribe(uint16_t attr_handle, bool cur_notify)
 
 void ble_cfg_svc_init(void)
 {
-    ble_cadence_set_scan_cb(cadence_scan_cb);
-    ble_hid_set_scan_cb(hid_scan_cb);
+    ble_central_mgr_set_select_cb(select_scan_cb);
     xTaskCreate(status_task, "cfg_status", 3072, NULL, 4, NULL);
     ESP_LOGI(TAG, "config service ready");
 }

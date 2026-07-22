@@ -25,7 +25,6 @@ static const char *TAG = "ble_hid";
 static const ble_uuid_t *HID_SVC_UUID = BLE_UUID16_DECLARE(HID_SVC_UUID16);
 static const ble_uuid_t *CCCD_UUID    = BLE_UUID16_DECLARE(CCCD_UUID16);
 
-#define SCAN_DURATION_MS   6000
 /* Ignore press edges closer than this — debounce + double-report protection
  * (many remotes fire several reports per physical click). */
 #define PRESS_COOLDOWN_MS  300
@@ -63,7 +62,6 @@ static hid_dev_t s_dev[BLE_HID_MAX_REMOTES];
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool s_inited;
-static bool s_scanning;
 
 /* Buttons are identified by a press SIGNATURE shared across all remotes:
  * (device << 24) | (report << 16) | (first non-zero byte offset << 8) |
@@ -76,7 +74,6 @@ static uint8_t  s_pressed_mask;                  /* bit N = button N down */
 static int64_t  s_last_press_us[SETTINGS_BTN_SIGS];
 
 static ble_hid_press_cb_t s_press_cb;
-static ble_hid_scan_cb_t  s_scan_cb;
 
 /* ---------- helpers ---------- */
 
@@ -292,9 +289,9 @@ static void start_discovery(hid_dev_t *d)
     if (rc != 0) ESP_LOGW(TAG, "disc_svc rc=%d", rc);
 }
 
-/* ---------- scan ---------- */
+/* ---------- ble_central_mgr hooks ---------- */
 
-static bool adv_is_hid(const struct ble_hs_adv_fields *f)
+bool ble_hid_adv_match(const struct ble_hs_adv_fields *f)
 {
     for (int i = 0; i < f->num_uuids16; i++) {
         if (ble_uuid_u16(&f->uuids16[i].u) == HID_SVC_UUID16) return true;
@@ -302,61 +299,14 @@ static bool adv_is_hid(const struct ble_hs_adv_fields *f)
     /* Appearance category 15 = Human Interface Device (0x03C0..0x03FF) —
      * some remotes advertise only that. */
     if (f->appearance_is_present && (f->appearance >> 6) == 0x00F) return true;
-    return false;
+    /* HID markers are the fast path, but plenty of keyboards/remotes
+     * advertise neither the 0x1812 UUID nor an appearance (those often
+     * live only in the scan response, or nowhere) — so anything with a
+     * readable name is shown too. Binding is an explicit user pick, a
+     * longer list is harmless; nameless AND markerless beacons are
+     * still dropped to keep the noise down. */
+    return f->name && f->name_len;
 }
-
-static int hid_scan_gap_event(struct ble_gap_event *event, void *arg)
-{
-    (void)arg;
-    switch (event->type) {
-    case BLE_GAP_EVENT_DISC: {
-        struct ble_hs_adv_fields fields;
-        if (ble_hs_adv_parse_fields(&fields, event->disc.data,
-                                    event->disc.length_data) != 0) {
-            return 0;
-        }
-        /* HID markers are the fast path, but plenty of keyboards/remotes
-         * advertise neither the 0x1812 UUID nor an appearance (those often
-         * live only in the scan response, or nowhere) — so anything with a
-         * readable name is shown too. Binding is an explicit user pick, a
-         * longer list is harmless; nameless AND markerless beacons are
-         * still dropped to keep the noise down. */
-        if (!adv_is_hid(&fields) &&
-            !(fields.name && fields.name_len)) {
-            return 0;
-        }
-        char name[32] = {0};
-        if (fields.name && fields.name_len) {
-            size_t n = fields.name_len < sizeof(name) - 1 ? fields.name_len
-                                                          : sizeof(name) - 1;
-            memcpy(name, fields.name, n);
-        }
-        ESP_LOGI(TAG, "scan hit %02X:%02X:%02X:%02X:%02X:%02X \"%s\" rssi=%d",
-                 event->disc.addr.val[5], event->disc.addr.val[4],
-                 event->disc.addr.val[3], event->disc.addr.val[2],
-                 event->disc.addr.val[1], event->disc.addr.val[0],
-                 name, event->disc.rssi);
-        if (s_scan_cb) {
-            s_scan_cb(event->disc.addr.val, event->disc.addr.type, name,
-                      event->disc.rssi);
-        }
-        return 0;
-    }
-
-    case BLE_GAP_EVENT_DISC_COMPLETE:
-        ESP_LOGI(TAG, "scan complete, reason=%d", event->disc_complete.reason);
-        portENTER_CRITICAL(&s_mux);
-        s_scanning = false;
-        portEXIT_CRITICAL(&s_mux);
-        ble_central_mgr_kick();
-        return 0;
-
-    default:
-        return 0;
-    }
-}
-
-/* ---------- ble_central_mgr hooks ---------- */
 
 int ble_hid_get_wanted_addrs(ble_addr_t *out, int max)
 {
@@ -498,38 +448,6 @@ void ble_hid_client_init(void)
 }
 
 void ble_hid_set_press_cb(ble_hid_press_cb_t cb) { s_press_cb = cb; }
-void ble_hid_set_scan_cb(ble_hid_scan_cb_t cb)   { s_scan_cb = cb; }
-
-void ble_hid_scan_start(void)
-{
-    if (s_scanning) return;
-    ble_central_mgr_pause();
-    struct ble_gap_disc_params dp = { 0 };
-    dp.passive = 0;
-    dp.filter_duplicates = 1;
-    int rc = ble_gap_disc(ble_central_mgr_own_addr_type(), SCAN_DURATION_MS,
-                          &dp, hid_scan_gap_event, NULL);
-    if (rc == 0) {
-        portENTER_CRITICAL(&s_mux);
-        s_scanning = true;
-        portEXIT_CRITICAL(&s_mux);
-        ESP_LOGI(TAG, "scanning for HID remotes (%d ms)", SCAN_DURATION_MS);
-    } else {
-        ESP_LOGW(TAG, "ble_gap_disc rc=%d", rc);
-        ble_central_mgr_kick();
-    }
-}
-
-void ble_hid_scan_stop(void)
-{
-    if (s_scanning) {
-        ble_gap_disc_cancel();
-        portENTER_CRITICAL(&s_mux);
-        s_scanning = false;
-        portEXIT_CRITICAL(&s_mux);
-        ble_central_mgr_kick();
-    }
-}
 
 bool ble_hid_bind(const uint8_t addr[6], uint8_t addr_type)
 {
@@ -555,10 +473,7 @@ bool ble_hid_bind(const uint8_t addr[6], uint8_t addr_type)
              (int)(free_slot - s_dev),
              addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
              (unsigned)addr_type);
-    if (s_scanning) {
-        ble_gap_disc_cancel();
-        s_scanning = false;
-    }
+    ble_central_mgr_select_stop();   /* choice made — close the window */
     ble_central_mgr_kick();
     return true;
 }
@@ -597,10 +512,10 @@ void ble_hid_get(ble_hid_state_t *out)
             connected++;
         }
     }
+    out->scanning = ble_central_mgr_selecting() == BLE_CENTRAL_SELECT_BUTTON;
     portENTER_CRITICAL(&s_mux);
     out->bound_count     = bound;
     out->connected_count = connected;
-    out->scanning        = s_scanning;
     out->button_count    = s_sig_count;
     out->pressed_mask    = s_pressed_mask;
     portEXIT_CRITICAL(&s_mux);

@@ -2,8 +2,8 @@
 
 /* BLE central / HID-over-GATT (HOGP) host for shutter buttons and other HID
  * remotes. Up to BLE_HID_MAX_REMOTES devices can be bound and connected at
- * the same time (each keychain remote sleeps aggressively; the shared
- * whitelist connect in ble_central_mgr picks whichever wakes up).
+ * the same time (each keychain remote sleeps aggressively; ble_central_mgr's
+ * scan-driven reconnect picks whichever wakes up).
  *
  * Remotes expose HID service 0x1812 with one or more Report characteristics;
  * some give each physical button its own report, others pack both buttons
@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include "host/ble_gap.h"
+#include "host/ble_hs_adv.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,16 +41,8 @@ typedef struct {
  * the NimBLE host task — keep it short (queue work, don't block). */
 typedef void (*ble_hid_press_cb_t)(uint8_t btn_idx);
 
-/* Scan-result callback, same contract as the cadence one. */
-typedef void (*ble_hid_scan_cb_t)(const uint8_t addr[6], uint8_t addr_type,
-                                  const char *name, int8_t rssi);
-
 void ble_hid_client_init(void);
 void ble_hid_set_press_cb(ble_hid_press_cb_t cb);
-
-void ble_hid_scan_start(void);
-void ble_hid_scan_stop(void);
-void ble_hid_set_scan_cb(ble_hid_scan_cb_t cb);
 
 /* Bind ADDS a remote (up to BLE_HID_MAX_REMOTES; re-binding a known address
  * is a no-op). forget disconnects and clears ALL remotes, their bonds and
@@ -61,6 +54,8 @@ void ble_hid_forget(void);
 void ble_hid_get(ble_hid_state_t *out);
 
 /* ---- ble_central_mgr hooks (NimBLE host task) ---- */
+
+bool ble_hid_adv_match(const struct ble_hs_adv_fields *f);
 
 /* Append the addresses of bound-but-disconnected remotes to out (up to max).
  * Returns how many were written. */

@@ -35,7 +35,6 @@ static const ble_uuid_t *BATT_LVL_UUID = BLE_UUID16_DECLARE(0x2A19);
  * characteristic, not CSC). */
 #define CSC_SVC_UUID16 0x1816
 
-#define SCAN_DURATION_MS 6000
 #define SENSOR_NAME_HINT "BK6LS"
 
 /* ---- module state ---- */
@@ -47,7 +46,6 @@ static bool     s_inited;
 static bool      s_bound;
 static ble_addr_t s_bound_addr;
 
-static bool      s_scanning;
 static bool      s_connected;          /* link up + subscribed to RPM */
 static uint16_t  s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
@@ -58,8 +56,6 @@ static uint16_t  s_rpm_cccd_handle;
 static int16_t   s_centi_rpm;
 static int64_t   s_rpm_rx_us;          /* esp_timer_get_time() of last RPM rx; 0 = never */
 static uint8_t   s_battery = 0xFF;
-
-static ble_cadence_scan_cb_t s_scan_cb;
 
 /* ---------- helpers ---------- */
 
@@ -201,9 +197,9 @@ static void start_discovery(uint16_t conn)
     ble_gattc_disc_svc_by_uuid(conn, &CAD_SVC_UUID.u, on_rpm_svc, NULL);
 }
 
-/* ---------- scan-result filtering ---------- */
+/* ---------- ble_central_mgr hooks ---------- */
 
-static bool adv_is_cadence_sensor(const struct ble_hs_adv_fields *f)
+bool ble_cadence_adv_match(const struct ble_hs_adv_fields *f)
 {
     /* Match by complete/short name prefix "BK6LS" OR an advertised 16-bit
      * CSC service UUID (0x1816). */
@@ -218,55 +214,6 @@ static bool adv_is_cadence_sensor(const struct ble_hs_adv_fields *f)
     }
     return false;
 }
-
-/* ---------- GAP events (selection scan only; connections live in
- * ble_central_mgr and are fanned back in via the hooks below) ---------- */
-
-static int cadence_scan_gap_event(struct ble_gap_event *event, void *arg)
-{
-    (void)arg;
-    switch (event->type) {
-    case BLE_GAP_EVENT_DISC: {
-        struct ble_hs_adv_fields fields;
-        if (ble_hs_adv_parse_fields(&fields, event->disc.data,
-                                    event->disc.length_data) != 0) {
-            return 0;
-        }
-        if (!adv_is_cadence_sensor(&fields)) {
-            return 0;
-        }
-        char name[32] = {0};
-        if (fields.name && fields.name_len) {
-            size_t n = fields.name_len < sizeof(name) - 1 ? fields.name_len
-                                                          : sizeof(name) - 1;
-            memcpy(name, fields.name, n);
-        }
-        ESP_LOGI(TAG, "scan hit %02X:%02X:%02X:%02X:%02X:%02X \"%s\" rssi=%d",
-                 event->disc.addr.val[5], event->disc.addr.val[4],
-                 event->disc.addr.val[3], event->disc.addr.val[2],
-                 event->disc.addr.val[1], event->disc.addr.val[0],
-                 name, event->disc.rssi);
-        if (s_scan_cb) {
-            s_scan_cb(event->disc.addr.val, event->disc.addr.type, name,
-                      event->disc.rssi);
-        }
-        return 0;
-    }
-
-    case BLE_GAP_EVENT_DISC_COMPLETE:
-        ESP_LOGI(TAG, "scan complete, reason=%d", event->disc_complete.reason);
-        portENTER_CRITICAL(&s_mux);
-        s_scanning = false;
-        portEXIT_CRITICAL(&s_mux);
-        ble_central_mgr_kick();    /* resume connecting to the bound peers */
-        return 0;
-
-    default:
-        return 0;
-    }
-}
-
-/* ---------- ble_central_mgr hooks ---------- */
 
 bool ble_cadence_get_wanted_addr(ble_addr_t *out)
 {
@@ -327,44 +274,6 @@ void ble_cadence_client_init(void)
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 }
 
-void ble_cadence_set_scan_cb(ble_cadence_scan_cb_t cb)
-{
-    s_scan_cb = cb;
-}
-
-void ble_cadence_scan_start(void)
-{
-    if (s_scanning) return;
-    /* A pending connect uses the scanner — cancel it so the selection scan can
-     * run; DISC_COMPLETE re-arms the connect afterwards. */
-    ble_central_mgr_pause();
-    struct ble_gap_disc_params dp = { 0 };
-    dp.passive = 0;          /* active scan to capture the scan-response name */
-    dp.filter_duplicates = 1;
-    int rc = ble_gap_disc(ble_central_mgr_own_addr_type(), SCAN_DURATION_MS,
-                          &dp, cadence_scan_gap_event, NULL);
-    if (rc == 0) {
-        portENTER_CRITICAL(&s_mux);
-        s_scanning = true;
-        portEXIT_CRITICAL(&s_mux);
-        ESP_LOGI(TAG, "scanning for cadence sensors (%d ms)", SCAN_DURATION_MS);
-    } else {
-        ESP_LOGW(TAG, "ble_gap_disc rc=%d", rc);
-        ble_central_mgr_kick();
-    }
-}
-
-void ble_cadence_scan_stop(void)
-{
-    if (s_scanning) {
-        ble_gap_disc_cancel();
-        portENTER_CRITICAL(&s_mux);
-        s_scanning = false;
-        portEXIT_CRITICAL(&s_mux);
-        ble_central_mgr_kick();
-    }
-}
-
 void ble_cadence_bind(const uint8_t addr[6], uint8_t addr_type)
 {
     portENTER_CRITICAL(&s_mux);
@@ -375,10 +284,7 @@ void ble_cadence_bind(const uint8_t addr[6], uint8_t addr_type)
     ESP_LOGI(TAG, "bound sensor %02X:%02X:%02X:%02X:%02X:%02X (type %u)",
              addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
              (unsigned)addr_type);
-    if (s_scanning) {
-        ble_gap_disc_cancel();
-        s_scanning = false;
-    }
+    ble_central_mgr_select_stop();   /* choice made — close the window */
     /* If a different sensor is currently linked, drop it — the disconnect
      * path re-arms toward the new address. */
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
@@ -410,10 +316,11 @@ bool ble_cadence_is_bound(void)
 void ble_cadence_get(ble_cadence_state_t *out)
 {
     if (!out) return;
+    out->scanning =
+        ble_central_mgr_selecting() == BLE_CENTRAL_SELECT_CADENCE;
     portENTER_CRITICAL(&s_mux);
     out->bound     = s_bound;
     out->connected = s_connected;
-    out->scanning  = s_scanning;
     out->centi_rpm = s_centi_rpm;
     out->battery   = s_battery;
     int64_t rx = s_rpm_rx_us;
