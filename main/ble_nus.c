@@ -18,6 +18,7 @@
 #include "vesc_can/packet_parser.h"
 #include "vesc_can/vesc_datatypes.h"
 #include "vesc_can/vesc_io_data.h"
+#include "vesc_can/vesc_lisp_panel.h"
 #include "vesc_can/vesc_lisp_poll.h"
 #include "vesc_can/vesc_rt_data.h"
 
@@ -92,6 +93,7 @@ static void poll_resume_cb(void *arg)
     (void)arg;
     if (!s_pollers_paused) return;
     s_pollers_paused = false;
+    vesc_lisp_panel_polls_pause(false);
     /* Unlike the P4 display, the helper never runs the RT/LISP pollers
      * (nothing consumes them and the P4 on the same bus already polls), so
      * "resume" only lifts the pause flag — don't start what wasn't running. */
@@ -112,6 +114,10 @@ static void lisp_transfer_touch(void)
         vesc_rt_data_stop();
         vesc_lisp_poll_stop();
         vesc_io_data_set_active(false);
+        /* Panel taps / state queries flush from the CAN task regardless of
+         * whether its periodic polling is on, and their replies share the one
+         * per-sender reassembly slot with the code chunks. */
+        vesc_lisp_panel_polls_pause(true);
         ESP_LOGI(TAG, "LISP transfer active — pollers paused");
     }
     esp_timer_stop(s_poll_resume_timer);

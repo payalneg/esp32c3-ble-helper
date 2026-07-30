@@ -35,6 +35,9 @@ static bool               s_have_ui;       /* set once a UI_DESC lands */
 /* CAN polling state — all touched only by the poll task (poll_loop), except
  * s_enabled (set from the LVGL task on open/close) and the action queue. */
 static volatile bool      s_enabled;       /* drawer open → keep polling */
+/* Set from whichever task drives a LISP code transfer (the BLE bridge's NimBLE
+ * callback or the on-device uploader) — see vesc_lisp_panel_polls_pause. */
+static volatile bool      s_polls_paused;
 static uint32_t           s_last_poll_ms;
 static QueueHandle_t      s_action_q;      /* {id,value} from LVGL tap handlers */
 
@@ -228,11 +231,26 @@ void vesc_lisp_panel_set_enabled(bool enabled)
     ESP_LOGW(TAG, "panel %s (target=%u)", enabled ? "ENABLED" : "disabled", s_target_vesc_id);
 }
 
+void vesc_lisp_panel_polls_pause(bool paused)
+{
+    if (s_polls_paused == paused) return;
+    s_polls_paused = paused;
+    /* Don't fire the instant the pause lifts — let the code transfer's last
+     * reply drain out of the reassembler first. */
+    if (!paused) {
+        uint32_t now = millis_now();
+        s_last_poll_ms = now;
+        s_dash_last_ms = now;
+    }
+}
+
 void vesc_lisp_panel_poll_loop(void)
 {
     /* Queued one-shot commands (taps, throttle toggle, state queries) flush
      * regardless of s_enabled — a poll-free headless device still needs the
      * command path. Only the PERIODIC UI/STATE polling below is gated. */
+    if (s_polls_paused) return;   /* a code transfer owns the reassembler */
+
     if (s_action_q) {
         vlp_action_t a;
         while (xQueueReceive(s_action_q, &a, 0) == pdTRUE) {
@@ -274,7 +292,7 @@ void vesc_lisp_panel_dash_loop(void)
     /* On the P4 display this ran always-on (the dashboard needs cruise/
      * profile). The helper is poll-free: nothing consumes the dash stats, so
      * gate it behind s_enabled like the rest of the periodic polling. */
-    if (!s_enabled) return;
+    if (!s_enabled || s_polls_paused) return;
     uint32_t now = millis_now();
     if (now - s_dash_last_ms < VLP_DASH_INTERVAL_MS) return;
     s_dash_last_ms = now;
