@@ -12,7 +12,11 @@
  * GUI in tools/config_gui.py); the Nordic UART service stays a transparent
  * VESC Tool bridge onto the CAN bus. */
 
+#include <stdio.h>
+
+#include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 
 #include "ble_cfg_svc.h"
@@ -104,6 +108,20 @@ void app_main(void)
                  esp_err_to_name(err));
     }
     comm_can_set_packet_handler(vesc_packet_dispatch);
+
+    /* Identity for VESC Tool's CAN scan: it pings the bus, then asks each node
+     * that answered for its firmware version, and lists whoever stays quiet as
+     * "Unknown". UUID = our BLE/WiFi MAC so two helpers on one bus are still
+     * distinguishable. */
+    {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_BT);
+        const esp_app_desc_t *desc = esp_app_get_description();
+        unsigned maj = 0, min = 0;
+        if (desc) sscanf(desc->version, "%u.%u", &maj, &min);
+        comm_can_set_fw_info("VESC BLE Helper", (uint8_t)maj, (uint8_t)min,
+                             mac, sizeof(mac));
+    }
 
     vesc_rt_data_init(tgt_id, CONFIG_VESC_CAN_RT_INTERVAL_MS);
     vesc_lisp_poll_init(tgt_id, CONFIG_VESC_CAN_LISP_INTERVAL_MS);
