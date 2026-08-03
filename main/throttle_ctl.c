@@ -30,10 +30,16 @@ void throttle_ctl_set(bool on)
 
 void throttle_ctl_toggle(void)
 {
-    /* Atomic on the VESC (VLP_MSG_THROTTLE_TOGGLE): the script flips its own
-     * `throttle-on` and answers with STATE, which refreshes our snapshot — no
-     * polling, no local guess about the current state. */
-    s_shadow = !throttle_ctl_get(NULL);
+    /* Which way to flip is decided on the CAN task, where the STATE replies are
+     * parsed: known state → absolute set, unknown → ask and retry. Do NOT
+     * pre-flip s_shadow from a guess — when the state was never learned that
+     * guess used to drive the actual command, and getting it backwards turns
+     * the LISP master switch off (pedal assist then coasts with a perfectly
+     * healthy cadence sensor). */
+    bool valid = false;
+    bool on    = throttle_ctl_get(&valid);
+    if (valid) s_shadow = !on;
     vesc_lisp_panel_send_throttle_toggle();
-    ESP_LOGI(TAG, "throttle toggle sent");
+    ESP_LOGI(TAG, "throttle toggle sent (state %s)",
+             valid ? (on ? "ON" : "off") : "unknown");
 }

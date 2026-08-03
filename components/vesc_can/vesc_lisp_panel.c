@@ -69,6 +69,19 @@ typedef struct { uint8_t id; float value; } vlp_action_t;
 static bool s_thr_known;
 static bool s_thr_on;
 
+/* Retry cadence for the initial STATE query, until the first reply lands. The
+ * helper is up ~1 s after power-on while the VESC is still loading main.lisp
+ * (@const-start writes every defun to flash), so the single boot-time
+ * query_state() usually misses. With periodic polling off by design that one
+ * miss was permanent: the app showed "no data from vesc" forever and the
+ * throttle toggle had nothing but a guess to work from. */
+#define VLP_STATE_RETRY_MS  1000
+static uint32_t s_state_retry_ms;
+
+/* How many times a queued throttle toggle may re-queue itself while waiting for
+ * the STATE reply that tells us which way to flip. */
+#define VLP_TOGGLE_MAX_RETRY  5
+
 static inline uint32_t millis_now(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -255,9 +268,34 @@ void vesc_lisp_panel_poll_loop(void)
         vlp_action_t a;
         while (xQueueReceive(s_action_q, &a, 0) == pdTRUE) {
             switch (a.id) {
-            case ACT_TOGGLE_THROTTLE:
-                send_request(VLP_MSG_THROTTLE_TOGGLE, 0, 0.0f, false);
+            case ACT_TOGGLE_THROTTLE: {
+                /* Never flip blind. The LISP-side toggle is atomic but relative:
+                 * without a known throttle-on, a press meant as "switch the
+                 * motor on" can just as easily switch it OFF — and with the
+                 * master switch off the arbiter coasts, so pedal assist goes
+                 * dead while the cadence sensor still reads fine.
+                 *
+                 * Known state → send an ABSOLUTE set (idempotent). Unknown →
+                 * ask for STATE and re-queue; the reply is parsed on can_proc,
+                 * so it lands by a later pass through this loop. a.value
+                 * carries the attempt counter (free on sentinel ids). */
+                bool on = false;
+                if (vesc_lisp_panel_get_throttle(&on)) {
+                    send_request(VLP_MSG_ACTION, VLP_THROTTLE_CTRL_ID,
+                                 on ? 0.0f : 1.0f, true);
+                } else if (a.value < (float)VLP_TOGGLE_MAX_RETRY) {
+                    send_request(VLP_MSG_REQ_STATE, 0, 0.0f, false);
+                    vlp_action_t again = { .id    = ACT_TOGGLE_THROTTLE,
+                                           .value = a.value + 1.0f };
+                    xQueueSend(s_action_q, &again, 0);
+                } else {
+                    /* Gave up learning the state — a relative toggle still
+                     * beats swallowing the button press entirely. */
+                    ESP_LOGW(TAG, "throttle toggle without known state");
+                    send_request(VLP_MSG_THROTTLE_TOGGLE, 0, 0.0f, false);
+                }
                 break;
+            }
             case ACT_QUERY_STATE:
                 send_request(VLP_MSG_REQ_STATE, 0, 0.0f, false);
                 break;
@@ -265,6 +303,19 @@ void vesc_lisp_panel_poll_loop(void)
                 send_request(VLP_MSG_ACTION, a.id, a.value, true);
                 break;
             }
+        }
+    }
+
+    /* Keep asking until the first STATE lands, then go quiet again — this is
+     * what makes the poll-free design survive a VESC that boots slower than we
+     * do (see VLP_STATE_RETRY_MS). Deliberately ahead of the s_enabled gate:
+     * the helper never enables periodic polling, so gating this too would leave
+     * it exactly as stuck as before. */
+    if (!vesc_lisp_panel_get_throttle(NULL)) {
+        uint32_t t = millis_now();
+        if (s_state_retry_ms == 0 || t - s_state_retry_ms >= VLP_STATE_RETRY_MS) {
+            s_state_retry_ms = t;
+            send_request(VLP_MSG_REQ_STATE, 0, 0.0f, false);
         }
     }
 

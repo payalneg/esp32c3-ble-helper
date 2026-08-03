@@ -2,7 +2,7 @@ name: vesc_ble_helper
 description: "Mobile configurator for the VESC BLE Helper (XIAO ESP32-C3)."
 publish_to: 'none'
 
-version: 1.0.6+8
+version: 1.0.7+9
 
 environment:
   sdk: ^3.7.2
