@@ -11,6 +11,7 @@
 #include "driver/twai.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -736,11 +737,54 @@ static void decode_msg(uint32_t eid, uint8_t *data8, int len)
     }
 }
 
+/* Bus-off recovery.
+ *
+ * When the transmit error counter passes 255 the TWAI controller drops into
+ * BUS_OFF and STOPS. It never comes back on its own: recovery has to be asked
+ * for, and after the controller has seen 128 sequences of 11 recessive bits it
+ * lands in STOPPED, where it needs an explicit start. Without this the node is
+ * simply gone from the bus until someone cycles its power — every send silently
+ * returns, so PAS setpoints, throttle toggles and state queries all die at once
+ * and nothing in the logs says why.
+ *
+ * That is not hypothetical here: this bus runs at 1 Mbit/s with three nodes and
+ * shows tens of thousands of bus errors, which is exactly the mill that grinds
+ * a node down to bus-off. Recovering keeps the helper alive through it.
+ *
+ * Checked from the receive task, which already wakes every 10 ms. */
+static void can_health_check(void)
+{
+    static uint32_t s_last_ms;
+    static uint32_t s_recoveries;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now - s_last_ms < 500) return;
+    s_last_ms = now;
+
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) != ESP_OK) return;
+
+    if (st.state == TWAI_STATE_BUS_OFF) {
+        ESP_LOGE(TAG, "TWAI bus-off (tx_err=%lu bus_err=%lu) — recovering",
+                 (unsigned long)st.tx_error_counter,
+                 (unsigned long)st.bus_error_count);
+        twai_initiate_recovery();
+    } else if (st.state == TWAI_STATE_STOPPED) {
+        /* Reached only after a recovery completed (comm_can_stop() tears the
+         * driver down instead of leaving it stopped), so restart the bus. */
+        if (twai_start() == ESP_OK) {
+            s_recoveries++;
+            ESP_LOGW(TAG, "TWAI back on the bus (recovery #%lu)",
+                     (unsigned long)s_recoveries);
+        }
+    }
+}
+
 static void rx_task(void *arg)
 {
     (void)arg;
     s_rx_running = true;
     while (!s_stop_rx) {
+        can_health_check();
         twai_message_t msg;
         if (twai_receive(&msg, pdMS_TO_TICKS(10)) == ESP_OK) {
             int next_write = s_rx_write + 1;
